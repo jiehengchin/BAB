@@ -110,6 +110,7 @@ class FundingDataBundle:
         price_df: pd.DataFrame,
         funding_df: pd.DataFrame,
         returns_df: Optional[pd.DataFrame] = None,
+        volume_df: Optional[pd.DataFrame] = None,
         btc_ret: Optional[pd.Series] = None,
         eth_ret: Optional[pd.Series] = None,
         min_hist_days: int = 30,
@@ -126,12 +127,15 @@ class FundingDataBundle:
         common_tickers = price_df.columns.intersection(funding_df.columns)
         if returns_df is not None:
             common_tickers = common_tickers.intersection(returns_df.columns)
+        if volume_df is not None:
+            common_tickers = common_tickers.intersection(volume_df.columns)
         
         # Sort tickers to ensure consistent order
         self.tickers = sorted(list(common_tickers))
         
         self.price_df = price_df[self.tickers]
         self.funding_df = funding_df[self.tickers]
+        self.volume_df = volume_df[self.tickers] if volume_df is not None else None
         
         if returns_df is not None:
             self.returns_df = returns_df[self.tickers]
@@ -348,6 +352,7 @@ class BettingAgainstBetaParams:
     min_funding_long: float = -0.0005   # Min funding allowed for longs (-5bps) - avoid costly longs
     volatility_scaling: bool = False    # Whether to scale weights by inverse volatility
     leverage_cap: float = 5.0           # Max Leverage for Frazzini method (safety brake)
+    volume_filter_threshold: float = 0.0 # Top N percentile volume filter (e.g. 0.8 to keep top 80%)
 
 class BettingAgainstBetaStrategy(Strategy):
     """
@@ -603,6 +608,15 @@ class BettingAgainstBetaWeighting(WeightingModel):
                 valid_longs.append(idx)
                 valid_long_w.append(w)
         
+        # Restrict to Top K (Largest weights -> Lowest Betas)
+        K = params.portfolio_size_each_side
+        if K > 0 and len(valid_longs) > K:
+            # Sort by weight descending (Largest absolute weight = Most Extreme Rank)
+            combined = sorted(zip(valid_long_w, valid_longs), key=lambda x: x[0], reverse=True)
+            combined = combined[:K]
+            valid_long_w = [x[0] for x in combined]
+            valid_longs = [x[1] for x in combined]
+
         # SHORT SIDE
         # Condition: Raw weight < 0 AND Short Eligible
         is_negative = raw_w < 0
@@ -616,6 +630,14 @@ class BettingAgainstBetaWeighting(WeightingModel):
             if short_mask[idx]:
                 valid_shorts.append(idx)
                 valid_short_w.append(w)
+
+        # Restrict to Top K (Largest weights -> Highest Betas)
+        if K > 0 and len(valid_shorts) > K:
+            # Sort by weight descending
+            combined = sorted(zip(valid_short_w, valid_shorts), key=lambda x: x[0], reverse=True)
+            combined = combined[:K]
+            valid_short_w = [x[0] for x in combined]
+            valid_shorts = [x[1] for x in combined]
 
         # OPTIONAL: Volatility Scaling
         # Divide weights by volatility (inverse vol weighting)
@@ -834,6 +856,7 @@ class BABBacktestEngine:
     
     def _universe_mask(self, idx: int, next_date: pd.Timestamp) -> np.ndarray:
         """Create mask for tradeable universe."""
+        current_date = self.bundle.price_df.index[idx]
         p_curr = self.bundle.price_df.iloc[idx].to_numpy()
         
         if next_date not in self.bundle.price_df.index:
@@ -842,6 +865,23 @@ class BABBacktestEngine:
         p_next = self.bundle.price_df.loc[next_date].to_numpy()
         has_price = np.isfinite(p_curr) & np.isfinite(p_next)
         
+        # Volume Filter
+        if self.params.volume_filter_threshold > 0 and self.bundle.volume_df is not None:
+            if current_date in self.bundle.volume_df.index:
+                v_curr = self.bundle.volume_df.loc[current_date].to_numpy()
+                v_curr = np.nan_to_num(v_curr, 0.0)
+                
+                # Determine threshold based on current universe
+                # e.g. 0.8 means keep top 80% (exclude bottom 20%)
+                # q = 1 - 0.8 = 0.2
+                
+                valid_vols = v_curr[has_price]
+                if len(valid_vols) > 0:
+                    q = 1.0 - self.params.volume_filter_threshold
+                    cutoff = np.quantile(valid_vols, q)
+                    has_volume = (v_curr >= cutoff)
+                    has_price = has_price & has_volume
+
         # Funding data is optional for BAB but still contributes to returns
         if next_date in self.bundle.funding_df.index:
             f_next = self.bundle.funding_df.loc[next_date].to_numpy()
