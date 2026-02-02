@@ -353,6 +353,8 @@ class BettingAgainstBetaParams:
     volatility_scaling: bool = False    # Whether to scale weights by inverse volatility
     leverage_cap: float = 5.0           # Max Leverage for Frazzini method (safety brake)
     volume_filter_threshold: float = 0.0 # Top N percentile volume filter (e.g. 0.8 to keep top 80%)
+    optimization_objective: str = "diversification" # "diversification" (min sum sq) or "min_variance" (min risk)
+    covariance_window: int = 90         # Lookback window for covariance estimation (if min_variance used)
 
 class BettingAgainstBetaStrategy(Strategy):
     """
@@ -376,8 +378,8 @@ class BettingAgainstBetaStrategy(Strategy):
         bundle.ensure_beta_matrix(windows)
         
         # Precompute Volatility if scaling is enabled
-        if getattr(self.params, "volatility_scaling", False):
-            self._ensure_volatility(bundle, self.params.beta_window)
+        # if getattr(self.params, "volatility_scaling", False):
+        #     self._ensure_volatility(bundle, self.params.beta_window)
 
     def _ensure_volatility(self, bundle: FundingDataBundle, window: int) -> None:
         """Ensure rolling volatility is computed."""
@@ -425,6 +427,7 @@ class BettingAgainstBetaStrategy(Strategy):
         # Get Betas
         if window not in bundle.betas:
             beta = np.full(len(bundle.tickers), np.nan)
+            beta_var = np.full(len(bundle.tickers), np.nan)
         else:
             betas_for_window = bundle.betas[window]
             
@@ -435,26 +438,35 @@ class BettingAgainstBetaStrategy(Strategy):
             if date in betas_for_window[beta_type].index:
                 raw_beta = betas_for_window[beta_type].loc[date].to_numpy()
                 
+                # Retrieve Beta Variance for Shrinkage AND Volatility Scaling
+                if window in bundle.beta_vars and beta_type in bundle.beta_vars[window]:
+                     if date in bundle.beta_vars[window][beta_type].index:
+                         beta_var = bundle.beta_vars[window][beta_type].loc[date].to_numpy()
+                     else:
+                         beta_var = np.full(len(bundle.tickers), np.nan)
+                else:
+                    beta_var = np.full(len(bundle.tickers), np.nan)
+
                 # Apply Shrinkage if enabled
                 if self.params.use_shrinkage:
                     from beta_shrink_func import shrink_beta_estimate
                     prior_window = self.params.prior_beta_window
                     
                     if prior_window in bundle.betas and prior_window in bundle.beta_vars:
-                        if window in bundle.beta_vars and beta_type in bundle.beta_vars[window]:
-                            beta_var = bundle.beta_vars[window][beta_type].loc[date].to_numpy()
-                        else:
-                            beta_var = np.full(len(bundle.tickers), np.nan)
+                         # beta_var already retrieved above
                         
                         priors_for_window = bundle.betas[prior_window]
                         prior_vars_for_window = bundle.beta_vars[prior_window]
                         
                         if beta_type in priors_for_window and beta_type in prior_vars_for_window:
-                            prior_beta = priors_for_window[beta_type].loc[date].to_numpy()
-                            prior_var = prior_vars_for_window[beta_type].loc[date].to_numpy()
-                            
-                            shrunk_beta, _ = shrink_beta_estimate(raw_beta, beta_var, prior_beta, prior_var)
-                            beta = shrunk_beta
+                            if date in priors_for_window[beta_type].index:
+                                prior_beta = priors_for_window[beta_type].loc[date].to_numpy()
+                                prior_var = prior_vars_for_window[beta_type].loc[date].to_numpy()
+                                
+                                shrunk_beta, _ = shrink_beta_estimate(raw_beta, beta_var, prior_beta, prior_var)
+                                beta = shrunk_beta
+                            else:
+                                beta = raw_beta
                         else:
                             beta = raw_beta
                     else:
@@ -463,13 +475,13 @@ class BettingAgainstBetaStrategy(Strategy):
                     beta = raw_beta
             else:
                 beta = np.full(len(bundle.tickers), np.nan)
+                beta_var = np.full(len(bundle.tickers), np.nan)
         
         # Get Volatility (if needed for scaling)
         vol = np.full(len(bundle.tickers), np.nan)
         if getattr(self.params, "volatility_scaling", False):
-            if hasattr(bundle, "volatilities") and window in bundle.volatilities:
-                 if date in bundle.volatilities[window].index:
-                     vol = bundle.volatilities[window].loc[date].to_numpy()
+            # Use Beta Variance (Standard Deviation of Beta Estimate)
+            vol = np.sqrt(beta_var)
 
         return {
             "beta": beta,
@@ -548,7 +560,7 @@ class BettingAgainstBetaWeighting(WeightingModel):
         if method == "frazzini_pedersen":
             return self._weights_frazzini_pedersen(beta, long_eligible, short_eligible, params, bundle, volatility)
         else:
-            return self._weights_rank_optimized(beta, long_eligible, short_eligible, params, bundle)
+            return self._weights_rank_optimized(beta, long_eligible, short_eligible, params, bundle, idx)
 
     def _weights_frazzini_pedersen(
         self, 
@@ -655,9 +667,9 @@ class BettingAgainstBetaWeighting(WeightingModel):
                 
                 # Apply inverse vol scaling
                 # Raw weights are rank-based. We tilt them by stability.
-                # W_new = W_rank * (1 / Vol)
+                # W_new = W_rank / Var(beta) = W_rank / (Vol^2)
                 ws_l = np.array(valid_long_w)
-                ws_l_scaled = ws_l / vols_l 
+                ws_l_scaled = ws_l / (vols_l ** 2)
                 valid_long_w = list(ws_l_scaled)
 
              # Scale Shorts
@@ -667,7 +679,7 @@ class BettingAgainstBetaWeighting(WeightingModel):
                 vols_s[vols_s < 1e-6] = np.mean(vols_s) 
                 
                 ws_s = np.array(valid_short_w)
-                ws_s_scaled = ws_s / vols_s
+                ws_s_scaled = ws_s / (vols_s ** 2)
                 valid_short_w = list(ws_s_scaled)
                 
         # SCALING
@@ -723,6 +735,7 @@ class BettingAgainstBetaWeighting(WeightingModel):
         short_mask: np.ndarray,
         params: BettingAgainstBetaParams,
         bundle: FundingDataBundle,
+        idx: int = -1,
     ) -> np.ndarray:
         
         # Identify available assets
@@ -748,16 +761,16 @@ class BettingAgainstBetaWeighting(WeightingModel):
         # Walk from left (Low Beta) to find K long candidates
         long_indices = []
         for loc in sorted_args:
-            idx = available_indices[loc]
-            if len(long_indices) < k and long_mask[idx]:
-                long_indices.append(idx)
+            idx_map = available_indices[loc]
+            if len(long_indices) < k and long_mask[idx_map]:
+                long_indices.append(idx_map)
         
         # Walk from right (High Beta) to find K short candidates
         short_indices = []
         for loc in sorted_args[::-1]:
-            idx = available_indices[loc]
-            if len(short_indices) < k and short_mask[idx]:
-                short_indices.append(idx)
+            idx_map = available_indices[loc]
+            if len(short_indices) < k and short_mask[idx_map]:
+                short_indices.append(idx_map)
         
         long_indices = np.array(long_indices)
         short_indices = np.array(short_indices)
@@ -765,7 +778,7 @@ class BettingAgainstBetaWeighting(WeightingModel):
         if len(long_indices) == 0 or len(short_indices) == 0:
             return np.zeros(len(beta))
 
-        # --- OPTIMIZATION (Same as original but with specific indices) ---
+        # --- OPTIMIZATION ---
         beta_long = beta[long_indices]
         beta_short = beta[short_indices]
         
@@ -773,43 +786,122 @@ class BettingAgainstBetaWeighting(WeightingModel):
         target_beta = params.target_side_beta
         tol = params.beta_tolerance
         
-        # Check feasibility
-        max_ach_long = np.sum(beta_long) * params.max_weight
-        max_ach_short = np.sum(beta_short) * params.max_weight
+        # Covariance for Min Variance
+        cov_long_mat = None
+        cov_short_mat = None
         
-        eff_tg_long = min(target_beta, max_ach_long * 0.95)
-        eff_tg_short = min(target_beta, max_ach_short * 0.95)
-        eff_target = min(eff_tg_long, eff_tg_short)
+        is_min_var = getattr(params, "optimization_objective", "diversification") == "min_variance"
         
-        if eff_target < 0.1: return np.zeros(len(beta))
+        if is_min_var and idx > 0:
+            from beta_shrink_func import shrink_covariance_bayes
+            
+            # Windows
+            win_l = getattr(params, "covariance_window", 90)
+            win_s = max(10, win_l // 3) # Short window approx 1/3 of long
+            
+            # Start indices
+            start_l = max(0, idx - win_l)
+            start_s = max(0, idx - win_s)
+            
+            # Slices
+            hist_l = bundle.returns_df.iloc[start_l:idx]
+            hist_s = bundle.returns_df.iloc[start_s:idx]
+            
+            if not hist_l.empty and not hist_s.empty:
+                # --- LONG LEG ---
+                rets_l_long = hist_l.iloc[:, long_indices]
+                rets_l_short = hist_s.iloc[:, long_indices]
+                
+                # Raw Covariances
+                c_l_long = rets_l_long.cov().to_numpy()
+                c_l_short = rets_l_short.cov().to_numpy()
+                
+                # Handle NaNs and regularization
+                c_l_long = np.nan_to_num(c_l_long, 0.0)
+                c_l_short = np.nan_to_num(c_l_short, 0.0)
+                
+                # Shrink
+                n_l = len(hist_l)
+                n_s = len(hist_s)
+                cov_long_mat = shrink_covariance_bayes(c_l_short, c_l_long, n_s, n_l)
+                
+                # Add slight regularization for solver stability
+                cov_long_mat += np.eye(len(long_indices)) * 1e-6
+                
+                # --- SHORT LEG ---
+                rets_s_long = hist_l.iloc[:, short_indices]
+                rets_s_short = hist_s.iloc[:, short_indices]
+                
+                c_s_long = rets_s_long.cov().to_numpy()
+                c_s_short = rets_s_short.cov().to_numpy()
+                
+                c_s_long = np.nan_to_num(c_s_long, 0.0)
+                c_s_short = np.nan_to_num(c_s_short, 0.0)
+                
+                cov_short_mat = shrink_covariance_bayes(c_s_short, c_s_long, n_s, n_l)
+                cov_short_mat += np.eye(len(short_indices)) * 1e-6
+
+        # Check feasibility (approx)
+        # We want to solve, so let solver decide feasibility usually, but simple checks help speed
         
+        lev_cap = getattr(params, "leverage_cap", 5.0)
+
         try:
             # LONG
             n_long = len(long_indices)
             w_long = cvx.Variable(n_long, nonneg=True)
-            obj_l = cvx.Minimize(cvx.sum_squares(w_long))
+            
+            if cov_long_mat is not None:
+                obj_l = cvx.Minimize(cvx.quad_form(w_long, cov_long_mat))
+            else:
+                obj_l = cvx.Minimize(cvx.sum_squares(w_long))
+            
+            # Constraints
+            # 1. Target Beta: sum(w * beta) = 1 (approx)
+            # 2. Max Weight per asset
+            # 3. Min Weight per asset
+            # 4. Leverage Cap: sum(w) <= Cap
+            
+            # Relax beta constraint slightly if needed, but BAB usually targets it strictly
             constr_l = [
-                beta_long @ w_long >= eff_target - tol,
-                beta_long @ w_long <= eff_target + tol,
-                w_long <= params.max_weight,
+                beta_long @ w_long >= target_beta - tol,
+                beta_long @ w_long <= target_beta + tol,
+                cvx.sum(w_long) <= lev_cap,
             ]
-            if params.min_weight > 0: constr_l.append(w_long >= params.min_weight)
+            
+            if params.max_weight <= 1.0:
+                 constr_l.append(w_long <= params.max_weight)
+                 
+            if params.min_weight > 0: 
+                constr_l.append(w_long >= params.min_weight)
             
             cvx.Problem(obj_l, constr_l).solve(solver=cvx.CLARABEL, verbose=False)
             
-            if w_long.value is None: return np.zeros(len(beta))
+            if w_long.value is None: 
+                # Fallback to pure equal weight or skip? Skip for safety.
+                return np.zeros(len(beta))
             weights_long = w_long.value
             
             # SHORT
             n_short = len(short_indices)
             w_short = cvx.Variable(n_short, nonneg=True)
-            obj_s = cvx.Minimize(cvx.sum_squares(w_short))
+            
+            if cov_short_mat is not None:
+                obj_s = cvx.Minimize(cvx.quad_form(w_short, cov_short_mat))
+            else:
+                obj_s = cvx.Minimize(cvx.sum_squares(w_short))
+                
             constr_s = [
-                beta_short @ w_short >= eff_target - tol,
-                beta_short @ w_short <= eff_target + tol,
-                w_short <= params.max_weight,
+                beta_short @ w_short >= target_beta - tol,
+                beta_short @ w_short <= target_beta + tol,
+                cvx.sum(w_short) <= lev_cap,
             ]
-            if params.min_weight > 0: constr_s.append(w_short >= params.min_weight)
+            
+            if params.max_weight <= 1.0:
+                constr_s.append(w_short <= params.max_weight)
+                
+            if params.min_weight > 0: 
+                constr_s.append(w_short >= params.min_weight)
             
             cvx.Problem(obj_s, constr_s).solve(solver=cvx.CLARABEL, verbose=False)
             
@@ -819,9 +911,8 @@ class BettingAgainstBetaWeighting(WeightingModel):
             full_weights[long_indices] = weights_long
             full_weights[short_indices] = weights_short
             
-            gross_exp = np.sum(np.abs(full_weights))
-            if gross_exp > params.gross_exposure_limit:
-                full_weights *= (params.gross_exposure_limit / gross_exp)
+            # We do NOT rescale by gross_exposure_limit here if we want to respect the Beta Target.
+            # The leverage_cap inside solver ensures we are within safety limits.
             
             full_weights[np.abs(full_weights) < EPS] = 0.0
             return full_weights
