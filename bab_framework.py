@@ -98,6 +98,142 @@ def select_score(ret_series: pd.Series, equity_series: Optional[pd.Series] = Non
         )
     raise ValueError(f"Unsupported score_mode: {mode}")
 
+
+def compute_ic(forecasted_values: pd.Series, actual_values: pd.Series) -> float:
+    """
+    Computes the Information Coefficient (IC) between forecasted and actual values.
+    IC is the Spearman's rank correlation coefficient between the forecast and outcome.
+    """
+    if forecasted_values.empty or actual_values.empty or len(forecasted_values) != len(actual_values):
+        return float("nan")
+    
+    # Drop NaNs from both series for accurate correlation
+    combined = pd.DataFrame({'forecast': forecasted_values, 'actual': actual_values}).dropna()
+    
+    if len(combined) < 2: # Need at least 2 points for correlation
+        return float("nan")
+        
+    return float(combined['forecast'].corr(combined['actual'], method='spearman'))
+
+
+def compute_ir(
+    portfolio_returns: pd.Series, 
+    periods_per_year: float = PERIODS_PER_YEAR
+) -> float:
+    """
+    Computes the Information Ratio (IR) of portfolio returns.
+    Without a benchmark, this calculates Return / Volatility (similar to Sharpe Ratio with Rf=0).
+    """
+    if portfolio_returns.empty:
+        return float("nan")
+
+    # Drop NaNs
+    returns = portfolio_returns.dropna()
+
+    if len(returns) < 2:
+        return float("nan")
+
+    if returns.std() < EPS: # Volatility is near zero
+        return float("inf") if returns.mean() > 0 else float("nan")
+
+    annualized_return = returns.mean() * periods_per_year
+    annualized_volatility = returns.std() * np.sqrt(periods_per_year)
+    
+    if annualized_volatility < 1e-10 or not np.isfinite(annualized_volatility):
+        return float("nan")
+
+    return float(annualized_return / annualized_volatility)
+
+
+def compute_rolling_ir(
+    portfolio_returns: pd.Series, 
+    window: int = 30,
+    periods_per_year: float = PERIODS_PER_YEAR
+) -> pd.Series:
+    """
+    Computes rolling Information Ratio (IR) over a specified window.
+    Without a benchmark, this calculates Rolling Return / Rolling Volatility.
+    """
+    if portfolio_returns.empty:
+        return pd.Series(dtype=float)
+
+    # Drop NaNs
+    returns = portfolio_returns.dropna()
+    
+    if len(returns) < window:
+        return pd.Series(dtype=float)
+
+    # Rolling Mean * Annualize (approximate for rolling window)
+    rolling_mean = returns.rolling(window).mean() * periods_per_year
+    # Rolling Std * Sqrt(Annualize)
+    rolling_std = returns.rolling(window).std() * np.sqrt(periods_per_year)
+    
+    return rolling_mean / rolling_std
+
+
+def compute_daily_ic(
+    detailed_df: pd.DataFrame,
+    date_col: str = 'date',
+    forecast_col: str = 'beta',
+    target_col: str = 'actual_return_total',
+    method: str = 'spearman'
+) -> pd.Series:
+    """
+    Computes the Cross-Sectional Information Coefficient (IC) for each date.
+    Returns a Series of IC values indexed by date.
+    """
+    if detailed_df.empty or date_col not in detailed_df.columns:
+        return pd.Series(dtype=float)
+
+    # Helper to calculate corr for a group
+    def _calc_corr(group):
+        if len(group) < 2:
+            return np.nan
+        # Ensure numeric
+        f = pd.to_numeric(group[forecast_col], errors='coerce')
+        t = pd.to_numeric(group[target_col], errors='coerce')
+        
+        valid = pd.DataFrame({'f': f, 't': t}).dropna()
+        if len(valid) < 2:
+            return np.nan
+        return valid['f'].corr(valid['t'], method=method)
+
+    # Group by date
+    return detailed_df.groupby(date_col).apply(_calc_corr, include_groups=False).sort_index()
+
+
+def compute_icir(ic_series: pd.Series) -> float:
+    """
+    Computes the Information Coefficient Information Ratio (ICIR).
+    ICIR = Mean(IC) / Std(IC)
+    """
+    if ic_series.empty or len(ic_series) < 2:
+        return float("nan")
+        
+    mean_ic = ic_series.mean()
+    std_ic = ic_series.std(ddof=1)
+    
+    if std_ic < 1e-10 or not np.isfinite(std_ic):
+        return float("nan")
+        
+    return float(mean_ic / std_ic)
+
+def compute_rolling_icir(
+    ic_series: pd.Series, 
+    window: int = 30
+) -> pd.Series:
+    """
+    Computes rolling Information Coefficient Information Ratio (ICIR) over a specified window.
+    ICIR = Rolling Mean(IC) / Rolling Std(IC)
+    """
+    if ic_series.empty or len(ic_series) < window:
+        return pd.Series(dtype=float)
+        
+    rolling_mean = ic_series.rolling(window).mean()
+    rolling_std = ic_series.rolling(window).std()
+    
+    return rolling_mean / rolling_std
+
 # --- Data Structures ---
 
 class FundingDataBundle:
@@ -1113,6 +1249,7 @@ class BABBacktestEngine:
                         'price_change': price_chg,
                         'price_return_contrib': w_j * price_chg,
                         'funding_return_contrib': -w_j * (f_next_full[j] if np.isfinite(f_next_full[j]) else 0.0),
+                        'actual_return_total': price_chg + (f_next_full[j] if np.isfinite(f_next_full[j]) else 0.0),
                     })
             
             equity *= (1.0 + daily_ret)
@@ -1301,8 +1438,10 @@ class BABWalkForwardRunner:
         oos_equity: pd.Series,
         oos_price_returns: Optional[pd.Series] = None,
         oos_funding_returns: Optional[pd.Series] = None,
+        detailed_df: Optional[pd.DataFrame] = None,
         plot: bool = True,
         fig_dir: Optional[str] = None,
+        title_suffix: str = "",
     ) -> Dict[str, Any]:
         """
         Generates a comprehensive performance report for BAB strategy.
@@ -1326,6 +1465,41 @@ class BABWalkForwardRunner:
             
             drawdown = (oos_equity / oos_equity.cummax() - 1.0)
             max_dd = drawdown.min()
+
+            # IR Analysis
+            rolling_ir = compute_rolling_ir(oos_returns, window=30, periods_per_year=per_year)
+            avg_rolling_ir = rolling_ir.mean()
+            
+            # IC Analysis
+            daily_ic = pd.Series(dtype=float)
+            rolling_icir = pd.Series(dtype=float)
+            mean_ic = np.nan
+            icir = np.nan
+            
+            if detailed_df is not None and not detailed_df.empty:
+                # We forecast 'beta' and want it to correlate with future returns?
+                # Actually for BAB: 
+                #   We Long Low Beta -> We want Low Beta to have High Return? No, BAB says Low Beta has higher risk-adjusted return.
+                #   The standard BAB factor is Long Low / Short High. 
+                #   So effective "Signal" is -Beta (Negative Beta). 
+                #   If Beta is high, we short (negative weight). If Beta is low, we long (positive weight).
+                #   So we check correlation between -Beta and Returns.
+                
+                # Make a copy to avoid modifying original
+                df_ic = detailed_df.copy()
+                df_ic['neg_beta'] = -df_ic['beta']
+                
+                daily_ic = compute_daily_ic(
+                    df_ic, 
+                    date_col='date', 
+                    forecast_col='neg_beta', 
+                    target_col='actual_return_total'
+                )
+                
+                if not daily_ic.empty:
+                    mean_ic = daily_ic.mean()
+                    icir = compute_icir(daily_ic)
+                    rolling_icir = compute_rolling_icir(daily_ic, window=30)
             
             # Additive PnL decomposition
             if oos_price_returns is not None and oos_funding_returns is not None:
@@ -1337,8 +1511,9 @@ class BABWalkForwardRunner:
                 price_pnl_additive = pd.Series(dtype=float)
                 funding_pnl_additive = pd.Series(dtype=float)
             
+            suffix_str = f" ({title_suffix})" if title_suffix else ""
             print("=" * 80)
-            print("AGGREGATED OUT-OF-SAMPLE PERFORMANCE (Betting Against Beta)")
+            print(f"AGGREGATED OUT-OF-SAMPLE PERFORMANCE (Betting Against Beta){suffix_str}")
             print("=" * 80)
             print(f"Mode: {self.mode.upper()}")
             print(f"Total OOS Bars: {len(oos_equity)}")
@@ -1350,6 +1525,10 @@ class BABWalkForwardRunner:
             print(f"Sortino:  {agg_sortino:.3f}")
             print(f"Calmar:   {agg_calmar:.3f}")
             print(f"Composite:{agg_comp:.3f}")
+            print(f"Avg Rolling IR (30d): {avg_rolling_ir:.3f}")
+            print("--- Forecasting Skill ---")
+            print(f"Mean IC:  {mean_ic:.4f}")
+            print(f"ICIR:     {icir:.3f}")
             print("--- Absolute ---")
             print(f"Total Return: {agg_total_ret*100:.2f}%")
             print(f"CAGR:         {agg_cagr*100:.2f}%")
@@ -1364,6 +1543,11 @@ class BABWalkForwardRunner:
                 "agg_total_return": agg_total_ret,
                 "agg_cagr": agg_cagr,
                 "agg_max_dd": max_dd,
+                "mean_ic": mean_ic,
+                "icir": icir,
+                "daily_ic": daily_ic,
+                "rolling_ir": rolling_ir,
+                "rolling_icir": rolling_icir,
                 "combined_equity": oos_equity,
                 "combined_drawdown": drawdown,
                 "total_pnl_additive": total_pnl_additive,
@@ -1404,15 +1588,18 @@ class BABWalkForwardRunner:
             print("wf_df is empty; no parameter summary available.")
         
         # 3. Plots
-        if plot:
+        if plot or fig_dir:
             try:
                 import matplotlib.pyplot as plt
                 plt.style.use("seaborn-v0_8")
                 
+                suffix_display = f" - {title_suffix}" if title_suffix else ""
+                clean_suffix = title_suffix.replace(" ", "_").lower() if title_suffix else ""
+                
                 # A. Equity & Drawdown
                 if not oos_equity.empty:
-                    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True, 
-                                             gridspec_kw={"height_ratios": [2, 1, 2]})
+                    fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True, 
+                                             gridspec_kw={"height_ratios": [2, 1, 1, 1]})
                     
                     # 1. Equity
                     axes[0].plot(oos_equity.index, oos_equity.values, 
@@ -1426,7 +1613,7 @@ class BABWalkForwardRunner:
                                     label="BTC Buy & Hold", color="tab:gray", linestyle="--", alpha=0.6)
                     
                     axes[0].set_ylabel("Equity")
-                    axes[0].set_title("Walk-Forward Equity Curve (Betting Against Beta)")
+                    axes[0].set_title(f"Walk-Forward Equity Curve{suffix_display}")
                     axes[0].legend()
                     axes[0].grid(True, alpha=0.3)
                     
@@ -1438,30 +1625,37 @@ class BABWalkForwardRunner:
                     axes[1].legend()
                     axes[1].grid(True, alpha=0.3)
                     
-                    # 3. PnL Decomposition
-                    if "total_pnl_additive" in out and not out["total_pnl_additive"].empty:
-                        t_pnl = out["total_pnl_additive"]
-                        p_pnl = out["price_pnl_additive"]
-                        f_pnl = out["funding_pnl_additive"]
-                        
-                        axes[2].plot(t_pnl.index, t_pnl.values, 
-                                    label="Total PnL", color="tab:gray", linestyle="--", alpha=0.8)
-                        axes[2].plot(p_pnl.index, p_pnl.values, 
-                                    label="Price Component", color="tab:blue", alpha=0.8)
-                        axes[2].plot(f_pnl.index, f_pnl.values, 
-                                    label="Funding Component", color="tab:orange", alpha=0.8)
-                        
-                        axes[2].set_title("PnL Attribution (Cumulative)")
-                        axes[2].set_xlabel("Date")
+                    # 3. Rolling ICIR (Replaces Rolling IR)
+                    if "rolling_icir" in out and not out["rolling_icir"].empty:
+                        ricir = out["rolling_icir"]
+                        axes[2].plot(ricir.index, ricir.values, label="Rolling ICIR (30d)", color="tab:purple")
+                        axes[2].axhline(0, color="black", linestyle="--", alpha=0.3)
+                        axes[2].set_ylabel("Rolling ICIR")
                         axes[2].legend()
                         axes[2].grid(True, alpha=0.3)
                     
+                    # 4. Rolling IC (30d)
+                    if "daily_ic" in out and not out["daily_ic"].empty:
+                        dic = out["daily_ic"]
+                        roll_ic = dic.rolling(30).mean()
+                        axes[3].plot(roll_ic.index, roll_ic.values, label="Rolling IC (30d)", color="tab:orange")
+                        
+                        axes[3].axhline(0, color="black", linestyle="--", alpha=0.3)
+                        axes[3].set_ylabel("Rolling IC")
+                        axes[3].set_xlabel("Date")
+                        axes[3].legend()
+                        axes[3].grid(True, alpha=0.3)
+
                     plt.tight_layout()
-                    if fig_path:
-                        fig.savefig(fig_path / "bab_performance_summary.png", dpi=150)
-                        plt.close(fig)
-                    else:
+                    
+                    if fig_dir:
+                        fname = f"bab_performance_summary_{clean_suffix}.png" if clean_suffix else "bab_performance_summary.png"
+                        fig.savefig(fig_path / fname, dpi=150)
+                        
+                    if plot:
                         plt.show()
+                    
+                    plt.close(fig)
                 
                 # B. Parameter Selection
                 if "best_params_df" in out:
@@ -1482,11 +1676,15 @@ class BABWalkForwardRunner:
                     # Hide unused subplot
                     axes.flatten()[-1].axis('off')
                     plt.tight_layout()
-                    if fig_path:
-                        fig.savefig(fig_path / "bab_parameter_counts.png", dpi=150)
-                        plt.close(fig)
-                    else:
+                    
+                    if fig_dir:
+                        fname = f"bab_parameter_counts_{clean_suffix}.png" if clean_suffix else "bab_parameter_counts.png"
+                        fig.savefig(fig_path / fname, dpi=150)
+                        
+                    if plot:
                         plt.show()
+                        
+                    plt.close(fig)
                 
                 # C. IS vs OOS Sharpe
                 if wf_df is not None and not wf_df.empty:
@@ -1498,15 +1696,19 @@ class BABWalkForwardRunner:
                     ax.axhline(0, color="black", linestyle="--", alpha=0.3)
                     ax.set_xlabel("Iteration")
                     ax.set_ylabel("Sharpe Ratio")
-                    ax.set_title("BAB: In-Sample vs Out-of-Sample Sharpe")
+                    ax.set_title(f"BAB: In-Sample vs Out-of-Sample Sharpe{suffix_display}")
                     ax.legend()
                     ax.grid(True, alpha=0.3)
                     plt.tight_layout()
-                    if fig_path:
-                        fig.savefig(fig_path / "bab_is_oos_sharpe.png", dpi=150)
-                        plt.close(fig)
-                    else:
+                    
+                    if fig_dir:
+                        fname = f"bab_is_oos_sharpe_{clean_suffix}.png" if clean_suffix else "bab_is_oos_sharpe.png"
+                        fig.savefig(fig_path / fname, dpi=150)
+                    
+                    if plot:
                         plt.show()
+                        
+                    plt.close(fig)
                 
             except ImportError:
                 print("matplotlib not available; skipping plots.")

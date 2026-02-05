@@ -737,3 +737,38 @@ def calculate_blume_beta(raw_beta: Union[float, pd.DataFrame, pd.Series],
     Adjusted Beta in the same format as input.
     """
     return (raw_beta * weight_raw) + (market_beta * weight_market)
+
+def shrink_covariance_bayes(cov_short: np.ndarray, cov_long: np.ndarray, n_short: int, n_long: int):
+    """
+    Shrink a short-window (noisy) covariance matrix towards a long-window (stable) prior.
+    
+    Logic similar to beta shrinkage:
+    Weight is determined by the relative uncertainty (variance) of the estimators.
+    
+    Parameters:
+    -----------
+    cov_short : np.ndarray
+        Covariance matrix from short window (e.g. 30 days).
+    cov_long : np.ndarray
+        Covariance matrix from long window (e.g. 90 days).
+    n_short : int
+        Number of observations in short window.
+    n_long : int
+        Number of observations in long window.
+        
+    Returns:
+    --------
+    np.ndarray
+        Shrunk covariance matrix.
+    """
+    # Uncertainty is inverse to sample size
+    var_short_proxy = 1.0 / n_short
+    var_long_proxy = 1.0 / n_long
+    
+    # Bayes weight for the PRIOR (Long window)
+    w_prior = var_short_proxy / (var_short_proxy + var_long_proxy)
+    
+    # Linear combination
+    cov_shrunk = (1.0 - w_prior) * cov_short + w_prior * cov_long
+    
+    return cov_shrunk
